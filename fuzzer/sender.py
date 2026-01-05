@@ -5,14 +5,14 @@ class Sender:
     def __init__(self, host="127.0.0.1", port=8080):
         self.host = host
         self.port = port
-        self.timeout = 1.0 # seconds
+        self.timeout = 0.1 # seconds (Fast fuzzing)
 
     def send(self, payload):
         """
         Sends a payload to the target.
         Returns:
-            True: If sent successfully.
-            False: If connection refused or error (Target likely down).
+            (success, status_code)
+            status_code: int (e.g., 200, 404, 500), or 0 if no response/error
         """
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(self.timeout)
@@ -20,19 +20,24 @@ class Sender:
             s.connect((self.host, self.port))
             s.sendall(payload)
             
-            # Optionally read response to ensure server processed it
-            # But for fuzzing, sometimes we just want to fire and forget
-            # Or read a bit to see if it responds validly
+            status_code = 0
             try:
-                s.recv(1024)
+                # Read response head
+                resp = s.recv(4096)
+                if resp:
+                    # Simple HTTP Status Parsing
+                    # ex: HTTP/1.1 200 OK
+                    first_line = resp.split(b"\r\n")[0]
+                    parts = first_line.split(b" ")
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        status_code = int(parts[1])
             except socket.timeout:
-                pass # Timeout is fine, server might process slowly
+                pass # Timeout is fine
                 
             s.close()
-            return True
+            return True, status_code
+            
         except ConnectionRefusedError:
-            # print("[Sender] Connection Refused - Target maybe down?")
-            return False
+            return False, 0
         except Exception as e:
-            # print(f"[Sender] Error: {e}")
-            return False
+            return False, 0
