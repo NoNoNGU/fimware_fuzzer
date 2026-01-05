@@ -39,13 +39,13 @@ class Executor:
 
     def check_alive(self):
         if self.process is None:
-            return False
+            return False, None
         
         ret = self.process.poll()
         if ret is not None:
             # print(f"[Executor] Target exited with code {ret}!")
-            return False
-        return True
+            return False, ret
+        return True, None
 
     def stop_target(self):
         if self.process:

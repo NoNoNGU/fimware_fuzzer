@@ -6,24 +6,33 @@ import subprocess
 import signal
 
 # [Harness Configuration]
-WINDOWS_BASE = r"c:\Users\ypete\Downloads\firmware_extract_tplink"
-WSL_BASE = "/mnt/c/Users/ypete/Downloads/firmware_extract_tplink"
-PROJECT_DIR_NAME = "tplink_fuzzer"
+# 동적 경로 계산 - 현재 스크립트 위치 기준
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.dirname(SCRIPT_DIR)  # harness의 상위 = 프로젝트 루트
 WORK_BASE = "/tmp"
 
 # Instance Configuration
 INSTANCE_ID = int(os.environ.get("INSTANCE_ID", 0))
 WORK_ROOTFS_NAME = f"tplink_fuzzer_rootfs_{INSTANCE_ID}"
 HTTP_PORT = str(8080 + INSTANCE_ID)
-SOCKET_NAME = f"ubus_{INSTANCE_ID}.sock"
+SOCKET_NAME = f"ub{INSTANCE_ID}.sock"  # 짧은 이름: /tmp/ub0.sock (12 bytes)
+
+def get_wsl_path(win_path):
+    """Windows 경로를 WSL 경로로 변환"""
+    if os.path.exists("/mnt/c"):
+        # WSL 환경
+        return win_path.replace("\\", "/").replace("C:", "/mnt/c").replace("c:", "/mnt/c")
+    return win_path
 
 def get_base_path():
+    """프로젝트 루트 경로 반환 (WSL 호환)"""
     if os.path.exists("/mnt/c"):
-        return WSL_BASE
-    return os.getcwd()
+        # WSL 환경에서 Windows 경로를 변환
+        return get_wsl_path(PROJECT_DIR)
+    return PROJECT_DIR
 
-SRC_PROJECT_PATH = os.path.join(get_base_path(), PROJECT_DIR_NAME)
-SRC_ROOTFS_PATH = os.path.join(SRC_PROJECT_PATH, "rootfs")
+SRC_PROJECT_PATH = get_base_path()
+SRC_ROOTFS_PATH = os.path.join(SRC_PROJECT_PATH, "squashfs-root")  # 펌웨어 루트 파일시스템
 SRC_TOOLS_PATH = os.path.join(SRC_PROJECT_PATH, "tools")
 DEST_ROOTFS_PATH = os.path.join(WORK_BASE, WORK_ROOTFS_NAME)
 QEMU_BINARY = os.path.join(SRC_TOOLS_PATH, "qemu-mipsel-static")
@@ -34,39 +43,45 @@ TARGET_FULL_PATH = os.path.join(DEST_ROOTFS_PATH, TARGET_BINARY_REL_PATH)
 
 def patch_binary(file_path):
     """
-    Patches a binary to use /tmp/ubus_{ID}.sock instead of /var/run/ubus.sock.
+    Patches a binary to use /tmp/ubus_{ID}.sock instead of default ubus socket paths.
+    Supports both /var/run/ubus.sock and /tmp/ubus.sock patterns.
     """
     if not os.path.exists(file_path):
         print(f"[{INSTANCE_ID}] Binary not found: {file_path}")
         return
 
-    # Original: /var/run/ubus.sock (18 bytes)
-    # Target:   /tmp/ubus_N.sock   (Max 18 bytes)
-    original_str = b"/var/run/ubus.sock"
     target_path_bytes = f"/tmp/{SOCKET_NAME}".encode()
     
-    # Pad with null bytes to match length
-    if len(target_path_bytes) > len(original_str):
-        print(f"[{INSTANCE_ID}] Error: Socket path too long for patching!")
-        return
+    # Possible original patterns to replace
+    original_patterns = [
+        b"/var/run/ubus.sock",  # 18 bytes
+        b"/tmp/ubus.sock",       # 14 bytes
+    ]
     
-    new_str = target_path_bytes + b"\x00" * (len(original_str) - len(target_path_bytes))
-    
-    # print(f"[{INSTANCE_ID}] Patching {os.path.basename(file_path)} -> {target_path_bytes}")
     try:
         with open(file_path, "rb") as f:
             data = f.read()
-            
-        if original_str not in data:
-            if target_path_bytes in data:
-                return # Already patched
-            # print(f"[{INSTANCE_ID}] Warning: Original string not found.")
-            return
-
-        newdata = data.replace(original_str, new_str)
         
-        with open(file_path, "wb") as f:
-            f.write(newdata)
+        # Check if already patched
+        if target_path_bytes in data:
+            return  # Already patched
+        
+        modified = False
+        for original_str in original_patterns:
+            if original_str in data:
+                # Pad with null bytes to match length
+                if len(target_path_bytes) > len(original_str):
+                    print(f"[{INSTANCE_ID}] Warning: Target path too long for {original_str}, skipping")
+                    continue
+                
+                new_str = target_path_bytes + b"\x00" * (len(original_str) - len(target_path_bytes))
+                data = data.replace(original_str, new_str)
+                modified = True
+                print(f"[{INSTANCE_ID}] Patched {os.path.basename(file_path)}: {original_str} -> {target_path_bytes}")
+        
+        if modified:
+            with open(file_path, "wb") as f:
+                f.write(data)
         
     except Exception as e:
         print(f"[{INSTANCE_ID}] Patch failed: {e}")
@@ -99,7 +114,16 @@ def run_fuzzer():
     env["QEMU_LD_PREFIX"] = DEST_ROOTFS_PATH
     
     host_socket_path = f"/tmp/{SOCKET_NAME}"
-    if os.path.exists(host_socket_path): os.remove(host_socket_path)
+    
+    # 기존 소켓 점유 프로세스 정리
+    if os.path.exists(host_socket_path):
+        subprocess.run(["fuser", "-k", host_socket_path], stderr=subprocess.DEVNULL)
+        try:
+            os.remove(host_socket_path)
+        except: pass
+    
+    # 잠시 대기
+    time.sleep(0.5)
 
     # Start ubusd
     ubusd_cmd = [
@@ -114,7 +138,7 @@ def run_fuzzer():
     ubusd_proc = subprocess.Popen(ubusd_cmd, env=env, stdout=ubusd_log, stderr=ubusd_log)
     
     started = False
-    for i in range(30):
+    for i in range(50):
         if ubusd_proc.poll() is not None:
              break
         if os.path.exists(host_socket_path):
@@ -134,7 +158,7 @@ def run_fuzzer():
         TARGET_FULL_PATH, 
         "-f",           
         "-p", HTTP_PORT,   
-        "-h", "/www",
+        "-h", os.path.join(DEST_ROOTFS_PATH, "www"),  # 호스트 절대 경로 사용
         "-U", host_socket_path 
     ]
     
@@ -142,7 +166,8 @@ def run_fuzzer():
     
     uhttpd_proc = None
     try:
-        uhttpd_proc = subprocess.Popen(target_cmd, env=env)
+        # cwd를 rootfs로 설정하여 상대 경로 접근 지원
+        uhttpd_proc = subprocess.Popen(target_cmd, env=env, cwd=DEST_ROOTFS_PATH)
         uhttpd_proc.wait()
     except KeyboardInterrupt:
         pass

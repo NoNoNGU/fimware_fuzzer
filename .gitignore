@@ -15,3 +15,4 @@ tplink_fuzzer/rootfs/
 
 # VSCode
 .vscode/
+squashfs-root
