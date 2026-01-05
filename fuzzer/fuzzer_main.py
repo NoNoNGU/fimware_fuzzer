@@ -10,6 +10,8 @@ from executor import Executor
 from sender import Sender
 from mutator import Mutator
 from coverage import CoverageManager
+from dashboard import FuzzerDashboard
+from rich.live import Live
 
 # Settings
 NUM_WORKERS = 4  # 병렬 워커 수 (CPU 코어 수에 맞게 조정)
@@ -42,7 +44,6 @@ def force_cleanup(instance_id):
     """강제 클린업 - 포트, 소켓, 프로세스 모두 정리"""
     port = 8080 + instance_id
     socket_path = f"/tmp/ub{instance_id}.sock"
-    rootfs_path = f"/tmp/tplink_fuzzer_rootfs_{instance_id}"
     
     # 포트 점유 프로세스 강제 종료
     subprocess.run(["fuser", "-k", "-9", f"{port}/tcp"], 
@@ -64,8 +65,6 @@ def force_cleanup(instance_id):
 def generate_crash_signature(exit_code, payload):
     """
     크래시 시그니처 생성
-    - Exit Code (시그널) + 페이로드 해시 조합
-    - 같은 페이로드로 같은 시그널이면 중복으로 간주
     """
     sig_name = "UNKNOWN"
     if exit_code is not None and exit_code < 0:
@@ -81,14 +80,17 @@ def generate_crash_signature(exit_code, payload):
     return signature, sig_name
 
 
-def validate_crash(executor, sender, payload, instance_id, max_retries=3):
+def validate_crash(executor, sender, payload, instance_id, seen_sigs, log_queue=None, max_retries=3):
     """
     크래시가 의심될 때, 깨끗한 상태에서 다시 한 번 실행하여 검증합니다.
-    재시작 실패 시 재시도합니다.
-    
-    Returns: (confirmed: bool, exit_code: int or None)
     """
-    print(f"[{instance_id}] 🔍 Validating potential crash...")
+    def log(msg):
+        if log_queue:
+            log_queue.put(msg)
+        else:
+            print(msg)
+
+    log(f"[{instance_id}] 🔍 Validating potential crash...")
     
     for attempt in range(max_retries):
         # 강제 클린업
@@ -96,7 +98,7 @@ def validate_crash(executor, sender, payload, instance_id, max_retries=3):
         
         # 타겟 재시작
         if not executor.restart_target():
-            print(f"[{instance_id}] ⏳ Restart attempt {attempt+1}/{max_retries} failed, retrying...")
+            log(f"[{instance_id}] ⏳ Restart attempt {attempt+1}/{max_retries} failed, retrying...")
             time.sleep(1)
             continue
         
@@ -111,26 +113,29 @@ def validate_crash(executor, sender, payload, instance_id, max_retries=3):
         is_alive, exit_code = executor.check_alive()
         
         if not is_alive:
-            print(f"[{instance_id}] ✅ Crash Confirmed! Exit Code: {exit_code}")
+            log(f"[{instance_id}] ✅ Crash Confirmed! Exit Code: {exit_code}")
             return True, exit_code
         else:
-            print(f"[{instance_id}] ⚠️ False Positive (Target stayed alive)")
+            log(f"[{instance_id}] ⚠️ False Positive (Target stayed alive)")
             return False, None
     
-    print(f"[{instance_id}] ❌ All restart attempts failed")
+    log(f"[{instance_id}] ❌ All restart attempts failed")
     return False, None
 
 
-def save_crash_if_unique(payload, exit_code, instance_id, seen_sigs):
+def save_crash_if_unique(payload, exit_code, instance_id, seen_sigs, log_queue):
     """
     시그니처 기반 중복 확인 후 저장
-    Returns: True if saved (unique), False if duplicate
     """
+    def log(msg):
+        if log_queue: log_queue.put(msg)
+        else: print(msg)
+
     signature, sig_name = generate_crash_signature(exit_code, payload)
     
     # 중복 확인
     if signature in seen_sigs:
-        print(f"[{instance_id}] 🔄 Duplicate crash (sig={signature}), skipping")
+        log(f"[{instance_id}] 🔄 Duplicate crash (sig={signature}), skipping")
         return False
     
     # 새로운 크래시 - 저장
@@ -149,17 +154,21 @@ def save_crash_if_unique(payload, exit_code, instance_id, seen_sigs):
     try:
         with open(save_path, "wb") as f:
             f.write(payload)
-        print(f"[{instance_id}] 💾 NEW unique crash saved: {sig_name}/{filename}")
+        log(f"[{instance_id}] 💾 NEW unique crash saved: {sig_name}/{filename}")
         return True
     except Exception as e:
-        print(f"[{instance_id}] Failed to save crash: {e}")
+        log(f"[{instance_id}] Failed to save crash: {e}")
         return False
 
 
-def fuzz_worker(instance_id, total_execs, total_crashes, total_unique, total_edges, seen_sigs):
+def fuzz_worker(instance_id, total_execs, total_crashes, total_unique, total_edges, seen_sigs, log_queue):
     """퍼징 워커 프로세스"""
     os.environ["INSTANCE_ID"] = str(instance_id)
     
+    def log(msg):
+        if log_queue: log_queue.put(msg)
+        else: print(msg)
+
     # 커버리지 트레이스 활성화
     if ENABLE_COVERAGE:
         os.environ["ENABLE_COVERAGE_TRACE"] = "1"
@@ -190,7 +199,7 @@ def fuzz_worker(instance_id, total_execs, total_crashes, total_unique, total_edg
 
     # Start Target
     if not executor.start_target():
-        print(f"[{instance_id}] Failed to start harness. Exiting worker.")
+        log(f"[{instance_id}] Failed to start harness. Exiting worker.")
         return
 
     local_execs = 0
@@ -210,7 +219,7 @@ def fuzz_worker(instance_id, total_execs, total_crashes, total_unique, total_edg
                     saved_path = cov_manager.save_interesting_input(payload, new_pcs)
                     if saved_path:
                         seeds.append(payload)  # 다음 변이에 사용
-                        print(f"[{instance_id}] 🌟 NEW coverage! +{new_count} edges, total: {cov_manager.total_edges}")
+                        log(f"[{instance_id}] 🌟 NEW coverage! +{new_count} edges, total: {cov_manager.total_edges}")
                         with total_edges.get_lock():
                             total_edges.value = cov_manager.total_edges
                 # 로그 초기화
@@ -222,7 +231,7 @@ def fuzz_worker(instance_id, total_execs, total_crashes, total_unique, total_edg
             if not is_alive:
                 # 크래시 의심 - 검증 시도
                 confirmed, valid_exit_code = validate_crash(
-                    executor, sender, payload, instance_id
+                    executor, sender, payload, instance_id, seen_sigs, log_queue
                 )
                 
                 if confirmed:
@@ -230,7 +239,7 @@ def fuzz_worker(instance_id, total_execs, total_crashes, total_unique, total_edg
                         total_crashes.value += 1
                     
                     # 중복 확인 후 저장
-                    if save_crash_if_unique(payload, valid_exit_code, instance_id, seen_sigs):
+                    if save_crash_if_unique(payload, valid_exit_code, instance_id, seen_sigs, log_queue):
                         with total_unique.get_lock():
                             total_unique.value += 1
                 
@@ -268,54 +277,60 @@ def start_fuzzing():
     total_unique = multiprocessing.Value('i', 0)
     total_edges = multiprocessing.Value('i', 0)
     
+    # Dashboard shared stats
+    stats_dict = {'execs': 0, 'crashes': 0, 'unique': 0, 'edges': 0, 'start_time': time.time()}
+    log_queue = multiprocessing.Queue()
+    
     print(f"[*] Starting {NUM_WORKERS} Parallel Fuzzers...")
     print(f"[*] Dictionary: {DICT_PATH}")
     print(f"[*] Corpus: {CORPUS_DIR}")
     print(f"[*] Coverage: {'Enabled' if ENABLE_COVERAGE else 'Disabled'}")
-    print(f"[*] Crash output: {CRASH_DIR_VERIFIED}")
     
     processes = []
     for i in range(NUM_WORKERS):
         p = multiprocessing.Process(
             target=fuzz_worker, 
-            args=(i, total_execs, total_crashes, total_unique, total_edges, seen_signatures)
+            args=(i, total_execs, total_crashes, total_unique, total_edges, seen_signatures, log_queue)
         )
         p.start()
         processes.append(p)
     
-    print("[*] Fuzzing Cluster Running! Press Ctrl+C to stop.")
-    start_time = time.time()
-
-    try:
-        while True:
-            time.sleep(1)
-            elapsed = time.time() - start_time
-            execs = total_execs.value
-            crashes = total_crashes.value
-            unique = total_unique.value
-            speed = execs / elapsed if elapsed > 0 else 0
-            
-            sys.stdout.write(
-                f"\r[*] Execs: {execs} | Edges: {total_edges.value} | "
-                f"Crashes: {crashes} | Unique: {unique} | Speed: {speed:.1f}/s   "
-            )
-            sys.stdout.flush()
-            
-            # Check if all workers died
-            if not any(p.is_alive() for p in processes):
-                print("\n[!] All workers died. Exiting.")
-                break
-
-    except KeyboardInterrupt:
-        print("\n[*] Stopping Cluster...")
-        for p in processes:
-            p.terminate()
-        for p in processes:
-            p.join()
+    # Dashboard 시작
+    dashboard = FuzzerDashboard(NUM_WORKERS, stats_dict, log_queue)
     
-    # 최종 통계
-    print(f"\n[*] Final Stats: {total_execs.value} execs, "
-          f"{total_crashes.value} crashes, {total_unique.value} unique")
+    with Live(dashboard.make_layout(), refresh_per_second=4, screen=False) as live:
+        try:
+            while True:
+                time.sleep(0.5)
+                
+                # Update Stats
+                stats_dict['execs'] = total_execs.value
+                stats_dict['crashes'] = total_crashes.value
+                stats_dict['unique'] = total_unique.value
+                stats_dict['edges'] = total_edges.value
+                
+                dashboard.stats = stats_dict # 갱신
+                
+                # Update UI
+                live.update(dashboard.update())
+                
+                # Check dead workers
+                if not any(p.is_alive() for p in processes):
+                    log_queue.put("[!] All workers died. Exiting.")
+                    break
+
+        except KeyboardInterrupt:
+            log_queue.put("[*] Stopping Cluster...")
+            
+        finally:
+            for p in processes:
+                p.terminate()
+            for p in processes:
+                p.join()
+            
+            # 최종 통계
+            print(f"\n[*] Final Stats: {total_execs.value} execs, "
+                  f"{total_crashes.value} crashes, {total_unique.value} unique")
 
 
 if __name__ == "__main__":
