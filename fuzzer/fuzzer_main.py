@@ -294,6 +294,7 @@ def start_fuzzing():
         )
         p.start()
         processes.append(p)
+        time.sleep(2)  # 워커 간 시작 딜레이 (Resource Contention 방지)
     
     # Dashboard 시작
     dashboard = FuzzerDashboard(NUM_WORKERS, stats_dict, log_queue)
