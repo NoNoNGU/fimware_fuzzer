@@ -9,6 +9,7 @@ import subprocess
 from executor import Executor
 from sender import Sender
 from mutator import Mutator
+from coverage import CoverageManager
 
 # Settings
 NUM_WORKERS = 4  # 병렬 워커 수 (CPU 코어 수에 맞게 조정)
@@ -25,6 +26,12 @@ for d in [CRASH_DIR_VERIFIED, CRASH_DIR_IGNORED]:
 DICT_PATH = os.path.join(BASE_DIR, "dictionaries", "http.dict")
 if not os.path.exists(DICT_PATH):
     DICT_PATH = None
+
+# 커버리지 가이드 설정
+ENABLE_COVERAGE = True  # 커버리지 추적 활성화
+CORPUS_DIR = os.path.join(BASE_DIR, "corpus")
+if not os.path.exists(CORPUS_DIR):
+    os.makedirs(CORPUS_DIR)
 
 # 전역 크래시 시그니처 집합 (중복 제거용) - Manager로 공유
 manager = multiprocessing.Manager()
@@ -149,17 +156,34 @@ def save_crash_if_unique(payload, exit_code, instance_id, seen_sigs):
         return False
 
 
-def fuzz_worker(instance_id, total_execs, total_crashes, total_unique, seen_sigs):
+def fuzz_worker(instance_id, total_execs, total_crashes, total_unique, total_edges, seen_sigs):
     """퍼징 워커 프로세스"""
     os.environ["INSTANCE_ID"] = str(instance_id)
+    
+    # 커버리지 트레이스 활성화
+    if ENABLE_COVERAGE:
+        os.environ["ENABLE_COVERAGE_TRACE"] = "1"
+    
     target_port = 8080 + instance_id
+    trace_log_path = f"/tmp/qemu_trace_{instance_id}.log"
 
     # Initialize components
     executor = Executor(HARNESS_SCRIPT)
     sender = Sender("127.0.0.1", target_port)
     mutator = Mutator(dict_path=DICT_PATH)
+    cov_manager = CoverageManager(corpus_dir=CORPUS_DIR) if ENABLE_COVERAGE else None
     
+    # 시드 설정: 코퍼스에 파일이 있으면 그것도 사용
     seeds = mutator.generate_initial_seeds()
+    if os.path.exists(CORPUS_DIR):
+        for fname in os.listdir(CORPUS_DIR):
+            fpath = os.path.join(CORPUS_DIR, fname)
+            if os.path.isfile(fpath):
+                try:
+                    with open(fpath, 'rb') as f:
+                        seeds.append(f.read())
+                except:
+                    pass
     
     # Cleanup previous run
     force_cleanup(instance_id)
@@ -177,6 +201,20 @@ def fuzz_worker(instance_id, total_execs, total_crashes, total_unique, seen_sigs
             payload = mutator.mutate(seed)
             
             sender.send(payload)
+            
+            # 커버리지 체크 (타겟이 살아있을 때만)
+            if ENABLE_COVERAGE and cov_manager:
+                is_new, new_count, new_pcs = cov_manager.check_new_coverage(trace_log_path)
+                if is_new:
+                    # 새로운 커버리지 발견! 시드로 저장
+                    saved_path = cov_manager.save_interesting_input(payload, new_pcs)
+                    if saved_path:
+                        seeds.append(payload)  # 다음 변이에 사용
+                        print(f"[{instance_id}] 🌟 NEW coverage! +{new_count} edges, total: {cov_manager.total_edges}")
+                        with total_edges.get_lock():
+                            total_edges.value = cov_manager.total_edges
+                # 로그 초기화
+                cov_manager.clear_log(trace_log_path)
             
             # Check Health
             is_alive, exit_code = executor.check_alive()
@@ -228,16 +266,19 @@ def start_fuzzing():
     total_execs = multiprocessing.Value('i', 0)
     total_crashes = multiprocessing.Value('i', 0)
     total_unique = multiprocessing.Value('i', 0)
+    total_edges = multiprocessing.Value('i', 0)
     
     print(f"[*] Starting {NUM_WORKERS} Parallel Fuzzers...")
     print(f"[*] Dictionary: {DICT_PATH}")
+    print(f"[*] Corpus: {CORPUS_DIR}")
+    print(f"[*] Coverage: {'Enabled' if ENABLE_COVERAGE else 'Disabled'}")
     print(f"[*] Crash output: {CRASH_DIR_VERIFIED}")
     
     processes = []
     for i in range(NUM_WORKERS):
         p = multiprocessing.Process(
             target=fuzz_worker, 
-            args=(i, total_execs, total_crashes, total_unique, seen_signatures)
+            args=(i, total_execs, total_crashes, total_unique, total_edges, seen_signatures)
         )
         p.start()
         processes.append(p)
@@ -255,8 +296,8 @@ def start_fuzzing():
             speed = execs / elapsed if elapsed > 0 else 0
             
             sys.stdout.write(
-                f"\r[*] Execs: {execs} | Crashes: {crashes} | "
-                f"Unique: {unique} | Speed: {speed:.1f}/s   "
+                f"\r[*] Execs: {execs} | Edges: {total_edges.value} | "
+                f"Crashes: {crashes} | Unique: {unique} | Speed: {speed:.1f}/s   "
             )
             sys.stdout.flush()
             
