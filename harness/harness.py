@@ -88,24 +88,20 @@ def patch_binary(file_path):
 
 def prepare_environ():
     if not os.path.exists(DEST_ROOTFS_PATH):
-        # Only copy if not exists (for speed on restart)
-        # But for parallelism, we might want fresh copies.
-        # Let's assume the manager cleans up if needed.
-        # print(f"[{INSTANCE_ID}] Copying rootfs...")
         subprocess.run(["cp", "-r", "--no-preserve=mode,ownership", SRC_ROOTFS_PATH, DEST_ROOTFS_PATH], check=True)
         subprocess.run(["chmod", "-R", "755", DEST_ROOTFS_PATH], check=True)
 
     var_path = os.path.join(DEST_ROOTFS_PATH, "var")
     if os.path.islink(var_path): os.unlink(var_path)
     if not os.path.exists(var_path): os.makedirs(var_path)
-    os.makedirs(os.path.join(var_path, "run"), exist_ok=True)
-    subprocess.run(["chmod", "-R", "777", var_path], check=False)
+    
+    run_dir = os.path.join(var_path, "run")
+    if not os.path.exists(run_dir): os.makedirs(run_dir)
+    
+    # Patch uhttpd
+    patch_binary(os.path.join(DEST_ROOTFS_PATH, "usr/sbin/uhttpd"))
+    # Patch libubox or other libs if needed (optional)
 
-    # Patch binaries with unique socket path
-    patch_binary(os.path.join(DEST_ROOTFS_PATH, "lib", "libubus.so"))
-    patch_binary(os.path.join(DEST_ROOTFS_PATH, "usr", "sbin", "uhttpd"))
-
-    return DEST_ROOTFS_PATH
 
 def run_fuzzer():
     prepare_environ()
@@ -133,8 +129,8 @@ def run_fuzzer():
         "-s", host_socket_path
     ]
     
-    # print(f"[{INSTANCE_ID}] Starting ubusd on {host_socket_path}...")
-    ubusd_log = open(f"ubusd_{INSTANCE_ID}.log", "w")
+    # 로그 파일 (/tmp에 저장)
+    ubusd_log = open(f"/tmp/ubusd_{INSTANCE_ID}.log", "w")
     ubusd_proc = subprocess.Popen(ubusd_cmd, env=env, stdout=ubusd_log, stderr=ubusd_log)
     
     started = False
@@ -150,6 +146,9 @@ def run_fuzzer():
         print(f"[{INSTANCE_ID}] ubusd failed to start.")
         ubusd_log.close()
         return
+
+    # ubusd 안정화 대기 (QEMU 에뮬레이션 지연 고려)
+    time.sleep(5.0)
 
     # Start uhttpd
     # 커버리지 트레이스 로그 경로 (환경변수로 활성화 제어)
@@ -173,12 +172,13 @@ def run_fuzzer():
         "-U", host_socket_path 
     ])
     
-    # print(f"[{INSTANCE_ID}] Starting uhttpd on port {HTTP_PORT}...")
+    # uhttpd 에러 로그
+    uhttpd_err_log = open(f"/tmp/uhttpd_err_{INSTANCE_ID}.log", "w")
     
     uhttpd_proc = None
     try:
         # cwd를 rootfs로 설정하여 상대 경로 접근 지원
-        uhttpd_proc = subprocess.Popen(target_cmd, env=env, cwd=DEST_ROOTFS_PATH)
+        uhttpd_proc = subprocess.Popen(target_cmd, env=env, cwd=DEST_ROOTFS_PATH, stderr=uhttpd_err_log)
         uhttpd_proc.wait()
     except KeyboardInterrupt:
         pass
@@ -189,6 +189,7 @@ def run_fuzzer():
             ubusd_proc.terminate()
             ubusd_proc.wait()
         ubusd_log.close()
+        uhttpd_err_log.close()
 
 if __name__ == "__main__":
     run_fuzzer()

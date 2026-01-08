@@ -19,8 +19,9 @@ HARNESS_SCRIPT = os.path.join(os.path.dirname(__file__), "..", "harness", "harne
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CRASH_DIR_VERIFIED = os.path.join(BASE_DIR, "crashes", "verified")
 CRASH_DIR_IGNORED = os.path.join(BASE_DIR, "crashes", "ignored")
+HTTP_ERROR_DIR = os.path.join(BASE_DIR, "crashes", "http_errors") # 500 에러 저장소
 
-for d in [CRASH_DIR_VERIFIED, CRASH_DIR_IGNORED]:
+for d in [CRASH_DIR_VERIFIED, CRASH_DIR_IGNORED, HTTP_ERROR_DIR]:
     if not os.path.exists(d):
         os.makedirs(d)
 
@@ -38,6 +39,7 @@ if not os.path.exists(CORPUS_DIR):
 # 전역 크래시 시그니처 집합 (중복 제거용) - Manager로 공유
 manager = multiprocessing.Manager()
 seen_signatures = manager.dict()
+seen_http_errors = manager.dict() # HTTP 에러 중복 제거용
 
 
 def force_cleanup(instance_id):
@@ -80,6 +82,32 @@ def generate_crash_signature(exit_code, payload):
     return signature, sig_name
 
 
+def save_http_error(payload, status, instance_id, seen_errors, log_queue):
+    """HTTP 500 등 서버 에러 저장"""
+    def log(msg):
+        if log_queue: log_queue.put(msg)
+        else: print(msg)
+
+    payload_hash = hashlib.md5(payload).hexdigest()[:8]
+    sig = f"{status}_{payload_hash}"
+    
+    if sig in seen_errors:
+        return
+    
+    seen_errors[sig] = True
+    
+    timestamp = int(time.time())
+    filename = f"error_{status}_{payload_hash}_{timestamp}.bin"
+    save_path = os.path.join(HTTP_ERROR_DIR, filename)
+    
+    try:
+        with open(save_path, "wb") as f:
+            f.write(payload)
+        log(f"[{instance_id}] 💾 Saved HTTP {status} Error: {filename}")
+    except Exception as e:
+        log(f"[{instance_id}] Failed to save error: {e}")
+
+
 def validate_crash(executor, sender, payload, instance_id, seen_sigs, log_queue=None, max_retries=3):
     """
     크래시가 의심될 때, 깨끗한 상태에서 다시 한 번 실행하여 검증합니다.
@@ -106,7 +134,7 @@ def validate_crash(executor, sender, payload, instance_id, seen_sigs, log_queue=
         time.sleep(0.5)
         
         # 페이로드 재전송
-        sender.send(payload)
+        sender.send(payload) # 여기서는 status code 무시
         
         # 상태 확인 (약간의 지연 후)
         time.sleep(0.3)
@@ -161,7 +189,7 @@ def save_crash_if_unique(payload, exit_code, instance_id, seen_sigs, log_queue):
         return False
 
 
-def fuzz_worker(instance_id, total_execs, total_crashes, total_unique, total_edges, seen_sigs, log_queue):
+def fuzz_worker(instance_id, total_execs, total_crashes, total_unique, total_edges, seen_sigs, seen_http_errors, log_queue):
     """퍼징 워커 프로세스"""
     os.environ["INSTANCE_ID"] = str(instance_id)
     
@@ -182,7 +210,7 @@ def fuzz_worker(instance_id, total_execs, total_crashes, total_unique, total_edg
     mutator = Mutator(dict_path=DICT_PATH)
     cov_manager = CoverageManager(corpus_dir=CORPUS_DIR) if ENABLE_COVERAGE else None
     
-    # 시드 설정: 코퍼스에 파일이 있으면 그것도 사용
+    # 시드 설정: 코퍼스 파일 로드 포함
     seeds = mutator.generate_initial_seeds()
     if os.path.exists(CORPUS_DIR):
         for fname in os.listdir(CORPUS_DIR):
@@ -203,13 +231,20 @@ def fuzz_worker(instance_id, total_execs, total_crashes, total_unique, total_edg
         return
 
     local_execs = 0
+    http_errors = 0 # 연속 에러 카운트
     
     try:
         while True:
             seed = seeds[local_execs % len(seeds)]
             payload = mutator.mutate(seed)
             
-            sender.send(payload)
+            # Send Payload & Get Status
+            sent, status = sender.send(payload)
+            
+            # HTTP Status Logging & Saving
+            if status >= 500:
+                log(f"[{instance_id}] 🔥 HTTP {status} Error detected!")
+                save_http_error(payload, status, instance_id, seen_http_errors, log_queue)
             
             # 커버리지 체크 (타겟이 살아있을 때만)
             if ENABLE_COVERAGE and cov_manager:
@@ -219,7 +254,7 @@ def fuzz_worker(instance_id, total_execs, total_crashes, total_unique, total_edg
                     saved_path = cov_manager.save_interesting_input(payload, new_pcs)
                     if saved_path:
                         seeds.append(payload)  # 다음 변이에 사용
-                        log(f"[{instance_id}] 🌟 NEW coverage! +{new_count} edges, total: {cov_manager.total_edges}")
+                        log(f"[{instance_id}] 🌟 NEW coverage! +{new_count} edges (Last HTTP: {status})")
                         with total_edges.get_lock():
                             total_edges.value = cov_manager.total_edges
                 # 로그 초기화
@@ -235,10 +270,10 @@ def fuzz_worker(instance_id, total_execs, total_crashes, total_unique, total_edg
                 )
                 
                 if confirmed:
+                    # 500 에러와 크래시는 별개 취급하되, 크래시가 우선
                     with total_crashes.get_lock():
                         total_crashes.value += 1
                     
-                    # 중복 확인 후 저장
                     if save_crash_if_unique(payload, valid_exit_code, instance_id, seen_sigs, log_queue):
                         with total_unique.get_lock():
                             total_unique.value += 1
@@ -267,7 +302,7 @@ def start_fuzzing():
     subprocess.run(["pkill", "-9", "-f", "qemu-mipsel"], stderr=subprocess.DEVNULL)
     time.sleep(1)
 
-    for d in [CRASH_DIR_VERIFIED, CRASH_DIR_IGNORED]:
+    for d in [CRASH_DIR_VERIFIED, CRASH_DIR_IGNORED, HTTP_ERROR_DIR]:
         if not os.path.exists(d):
             os.makedirs(d)
     
@@ -290,10 +325,11 @@ def start_fuzzing():
     for i in range(NUM_WORKERS):
         p = multiprocessing.Process(
             target=fuzz_worker, 
-            args=(i, total_execs, total_crashes, total_unique, total_edges, seen_signatures, log_queue)
+            args=(i, total_execs, total_crashes, total_unique, total_edges, seen_signatures, seen_http_errors, log_queue)
         )
         p.start()
         processes.append(p)
+        time.sleep(2)  # 워커 간 시작 딜레이
     
     # Dashboard 시작
     dashboard = FuzzerDashboard(NUM_WORKERS, stats_dict, log_queue)
