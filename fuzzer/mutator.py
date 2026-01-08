@@ -1,6 +1,7 @@
 import random
 import re
 import os
+import json
 
 class Mutator:
     def __init__(self, dict_path=None):
@@ -73,12 +74,52 @@ class Mutator:
         idx = random.randint(0, len(data))
         return bytes(data[:idx]) + word + bytes(data[idx:])
 
+    # --- JSON Structure Mutation ---
+    
+    def mutate_json_value(self, val):
+        """Recursively mutate JSON values while keeping structure"""
+        if isinstance(val, dict):
+            if not val: return val
+            k = random.choice(list(val.keys()))
+            val[k] = self.mutate_json_value(val[k])
+        
+        elif isinstance(val, list):
+            if not val: return val
+            idx = random.randint(0, len(val)-1)
+            val[idx] = self.mutate_json_value(val[idx])
+            
+        elif isinstance(val, str):
+            # String Mutation
+            r = random.random()
+            if r < 0.3:
+                # Injection
+                val += random.choice(["../../", "A"*1000, "%n%n%n", "' OR '1'='1"])
+            elif r < 0.6:
+                # Bit flip simulation
+                try:
+                    b = val.encode('latin-1')
+                    b = self.byte_flip(b)
+                    val = b.decode('latin-1')
+                except:
+                    val += "A"
+            else:
+                # Format string
+                val = "%s"*10
+                
+        elif isinstance(val, int):
+            # Integer Overflow
+            val = random.choice([-1, 0, 2147483648, -2147483648, val*100, val+1])
+            
+        elif isinstance(val, bool):
+            val = not val
+            
+        return val
+
     # --- Structure-Aware (HTTP) Mutation ---
     
     def parse_http(self, data):
         """
-        간단한 HTTP 파서. 완전하진 않지만 구조적 변이를 위해 사용.
-        Returns: { 'method': b'GET', 'uri': b'/', 'version': b'HTTP/1.1', 'headers': {...}, 'body': b'...' } or None
+        Returns: { 'method': b'GET', 'uri': b'/', 'version': b'HTTP/1.1', 'headers': [...], 'body': b'...' } or None
         """
         try:
             if b"\r\n\r\n" in data:
@@ -130,12 +171,9 @@ class Mutator:
             return b""
 
     def mutate_http_method(self, req):
-        """HTTP Method 변조 (Overflow, Invalid Verb)"""
         if random.random() < 0.5:
-            # 유효하지만 다른 메서드
             req['method'] = random.choice([b"POST", b"PUT", b"DELETE", b"HEAD", b"OPTIONS", b"TRACE", b"CONNECT"])
         else:
-            # Overflow 또는 Invalid
             req['method'] = random.choice([
                 b"A" * 100,  # Stack Overflow?
                 b"INVALID",
@@ -143,24 +181,18 @@ class Mutator:
             ])
 
     def mutate_http_uri(self, req):
-        """URI 변조 (Path Traversal, Injection)"""
         base_uri = req['uri']
-        
         strategy = random.choice(['append', 'replace', 'injection'])
         
         if strategy == 'append':
-            # 뒤에 위험한 payload 붙이기
             req['uri'] += random.choice(self.magic_numbers)
         elif strategy == 'replace':
-            # 경로 자체를 변경
             req['uri'] = random.choice(self.dangerous_paths)
         elif strategy == 'injection':
-            # 쿼리 스트링 또는 Path Injection
             injection = random.choice([b";reboot", b"|ls", b"$(id)", b"' OR '1'='1"])
             req['uri'] += injection
 
     def mutate_http_header(self, req):
-        """Header 변조"""
         if not req['headers']:
             req['headers'].append((b"User-Agent", b"Fuzzer"))
             
@@ -180,15 +212,52 @@ class Mutator:
             
         req['headers'][idx] = (k, v)
         
-        # 특정 헤더 집중 공격
         if random.random() < 0.3:
             req['headers'].append((b"Content-Length", b"-100"))
 
     def mutate_http_body(self, req):
-        """Body 변조 - 기존 bit/byte flip 활용"""
+        """Body 변조 - JSON Aware or Raw"""
         if not req['body']:
             req['body'] = b"A" * 100
-            
+            return
+
+        # Try JSON Mutation first
+        is_json = False
+        # Content-Type check (simple)
+        for k, v in req['headers']:
+            if k.lower() == b"content-type" and b"json" in v.lower():
+                is_json = True
+                break
+        
+        if not is_json and req['body'].strip().startswith(b"{"):
+            is_json = True
+
+        if is_json:
+            try:
+                # Decode -> Load -> Mutate -> Dump -> Encode
+                json_str = req['body'].decode('utf-8', errors='ignore')
+                json_obj = json.loads(json_str) 
+                
+                # Mutate JSON Structure
+                self.mutate_json_value(json_obj)
+                
+                new_body = json.dumps(json_obj).encode('utf-8')
+                req['body'] = new_body
+                
+                # Update Content-Length if exists
+                # (Optional, but good for validity)
+                new_headers = []
+                for k, v in req['headers']:
+                    if k.lower() == b"content-length":
+                        v = str(len(new_body)).encode()
+                    new_headers.append((k, v))
+                req['headers'] = new_headers
+                
+                return # JSON mutation success
+            except:
+                pass # JSON parsing failed, fall back to raw
+
+        # Fallback to Raw Mutation
         strategy = random.choice(['flip', 'magic', 'overflow'])
         
         if strategy == 'flip':
@@ -199,11 +268,10 @@ class Mutator:
             req['body'] += b"A" * 1024
 
     def mutate_structure_aware(self, data):
-        """구조 기반 변이 메인 로직"""
         req = self.parse_http(data)
-        if not req: return None  # 파싱 실패하면 None 반환
+        if not req: return None
         
-        target = random.choice(['method', 'uri', 'header', 'header', 'body'])
+        target = random.choice(['method', 'uri', 'header', 'header', 'body', 'body']) # Body 가중치 증가
         
         if target == 'method':
             self.mutate_http_method(req)
@@ -220,20 +288,19 @@ class Mutator:
         """Smart Mutation Entry Point"""
         r = random.random()
         
-        # 60% Chance: Structure Aware Mutation (Smart)
-        if r < 0.6:
+        # 70% Chance: Structure Aware (Smart)
+        if r < 0.7:
             res = self.mutate_structure_aware(data)
             if res: return res
-            # 파싱 실패 시 아래로 Fallback
         
         # 20% Chance: Magic/Dict Insert
-        if r < 0.8:
+        if r < 0.9:
             if random.random() < 0.5:
                 return self.dictionary_insert(data)
             else:
                 return self.magic_insert(data)
         
-        # 20% Chance: Raw Bit/Byte Flip
+        # 10% Chance: Raw Bit/Byte Flip
         else:
             if random.random() < 0.5:
                 return self.bit_flip(data)
@@ -243,7 +310,7 @@ class Mutator:
     def generate_initial_seeds(self):
         return [
             b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
-            b"POST /cgi-bin/luci HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\n\r\nadmin",
+            b"POST /cgi-bin/luci HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 35\r\n\r\n{\"method\":\"login\",\"params\":[\"admin\"]}",
             b"GET /webpages/index.html HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
             b"HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
             b"GET /nonexistent HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
