@@ -152,15 +152,26 @@ def run_fuzzer():
         return
 
     # Start uhttpd
+    # 커버리지 트레이스 로그 경로 (환경변수로 활성화 제어)
+    enable_trace = os.environ.get("ENABLE_COVERAGE_TRACE", "0") == "1"
+    trace_log_path = f"/tmp/qemu_trace_{INSTANCE_ID}.log"
+    
     target_cmd = [
         QEMU_BINARY,
         "-L", DEST_ROOTFS_PATH,
+    ]
+    
+    # 커버리지 트레이스 활성화 시 로깅 옵션 추가
+    if enable_trace:
+        target_cmd.extend(["-d", "exec,nochain", "-D", trace_log_path])
+    
+    target_cmd.extend([
         TARGET_FULL_PATH, 
         "-f",           
         "-p", HTTP_PORT,   
-        "-h", os.path.join(DEST_ROOTFS_PATH, "www"),  # 호스트 절대 경로 사용
+        "-h", os.path.join(DEST_ROOTFS_PATH, "www"),
         "-U", host_socket_path 
-    ]
+    ])
     
     # print(f"[{INSTANCE_ID}] Starting uhttpd on port {HTTP_PORT}...")
     
